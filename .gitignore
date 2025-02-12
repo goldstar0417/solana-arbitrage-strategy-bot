@@ -1,0 +1,7 @@
+# See https://github.com/goldstar0417/solana-arbitrage-strategy-bot.git for more about ignoring files.
+
+# Compiled output
+
+# Node
+/node_modules
+/package-lock.json
