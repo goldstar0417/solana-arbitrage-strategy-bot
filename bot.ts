@@ -17,12 +17,15 @@ import {
 import { Decimal } from "decimal.js";
 import bs58 from "bs58";
 import * as dotenv from "dotenv";
+import { trace } from "console";
 
 dotenv.config();
 
 const RPC_URL = process.env.RPC_URL;
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const MIN_PROFIT_THRESHOLD = process.env.ARB_THRESHOLD || 0.02;
+const BASE_FEE = process.env.BASE_FEE;
+const PRIORITY_FEE = Number(process.env.PRIORITY_FEE) || 100000; // Default to 100000 lamports if not set
 
 const connection = new Connection(RPC_URL!, {
   commitment: "confirmed",
@@ -38,22 +41,138 @@ const connection = new Connection(RPC_URL!, {
 const decodeKey = bs58.decode(PRIVATE_KEY!);
 const wallet = Keypair.fromSecretKey(Uint8Array.from(decodeKey!));
 
+const calculatePriorityFee = async (transaction: any) => {
+  const blockhashInfo = await connection.getLatestBlockhash();
+  transaction.recentBlockhash = blockhashInfo.blockhash;
+
+  const feeInLamports = await connection.getFeeForMessage(
+    transaction.compileMessage(), // Compile the transaction message
+    "confirmed"
+  );
+
+  if (!feeInLamports.value) {
+    console.log("Cannot fetch fees, defaulting to base fee.");
+    return BASE_FEE;
+  }
+
+  const adjustedFee = Math.min(feeInLamports.value + 2000, PRIORITY_FEE); // Add buffer of 2000 lamports
+
+  return adjustedFee;
+};
+
 const calculateProfit = (
   startAmount: Decimal,
   rate1: Decimal,
   rate2: Decimal,
   rate3: Decimal,
-  fee: Decimal
+  swapfee1: Decimal,
+  swapfee2: Decimal,
+  swapfee3: Decimal,
+  tranfee: Decimal
 ) => {
-  const afterFirstSwap = startAmount.mul(rate1).mul(Decimal.sub(1, fee)); // Token A -> Token B
-  const afterSecondSwap = afterFirstSwap.mul(rate2).mul(Decimal.sub(1, fee)); // Token B -> Token C
-  const finalAmount = afterSecondSwap.mul(rate3).mul(Decimal.sub(1, fee)); // Token C -> Token A
-  return finalAmount.sub(startAmount); // Net profit
+  const afterFirstSwap = startAmount.mul(rate1).mul(Decimal.sub(1, swapfee1)); // Token A -> Token B
+  const afterSecondSwap = afterFirstSwap
+    .mul(rate2)
+    .mul(Decimal.sub(1, swapfee2)); // Token B -> Token C
+  const finalAmount = afterSecondSwap.mul(rate3).mul(Decimal.sub(1, swapfee3)); // Token C -> Token A
+  return finalAmount.sub(startAmount).sub(tranfee.mul(3)); // Net profit
+};
+
+const calculateSwapFee = async (pool: OrcaPool) => {
+  // Get token reserves from pool
+  const tokenABalance = await connection.getTokenAccountBalance(
+    pool.getTokenA().addr
+  );
+  const tokenBBalance = await connection.getTokenAccountBalance(
+    pool.getTokenB().addr
+  );
+
+  // Convert to decimal values
+  const reserveA = new Decimal(tokenABalance.value.amount).div(
+    Math.pow(10, pool.getTokenA().scale)
+  );
+  const reserveB = new Decimal(tokenBBalance.value.amount).div(
+    Math.pow(10, pool.getTokenB().scale)
+  );
+
+  // Orca pools have a 0.3% fee (30 basis points)
+  const FEE_NUMERATOR = 30;
+  const FEE_DENOMINATOR = 10000;
+  const fee = new Decimal(FEE_NUMERATOR).div(FEE_DENOMINATOR);
+
+  // Calculate price impact based on reserves
+  const priceImpact = reserveB.div(reserveA);
+
+  // Calculate total swap fee including price impact
+  const swapFee = priceImpact.mul(fee);
+
+  return {
+    fee: swapFee,
+    reserveA: reserveA,
+    reserveB: reserveB,
+    priceImpact: priceImpact,
+  };
+};
+
+const getBestPoolForPair = async (orca: Orca) => {
+  let orcaPoolData = [];
+  let bestPools = [];
+  bestPools.push("SOL_USDC");
+  for (const poolName of Object.keys(OrcaPoolConfig)) {
+    if (poolName.includes("SOL")) {
+      const pairNames = poolName.split("_");
+      if (
+        pairNames.length == 2 &&
+        (pairNames.at(0) == "SOL" || pairNames.at(1) == "SOL")
+      ) {
+        const currentPool = orca.getPool(
+          OrcaPoolConfig[poolName as keyof typeof OrcaPoolConfig]
+        );
+        const swapFeeData = await calculateSwapFee(currentPool);
+        console.log(poolName, swapFeeData.fee);
+        orcaPoolData.push({
+          pairName: poolName,
+          mintAddress: poolName as keyof typeof OrcaPoolConfig,
+          fee: swapFeeData.fee,
+          priceImpact: swapFeeData.priceImpact,
+        });
+      }
+    }
+  }
+
+  // Sort by fee in descending order
+  orcaPoolData.sort((a: any, b: any) => a.fee - b.fee);
+  for (const value of orcaPoolData) {
+    const pairNames = value.pairName.split("_");
+    if (pairNames.at(0) == "SOL") {
+      const target = Object.keys(OrcaPoolConfig).filter(
+        (each) =>
+          each.includes(pairNames.at(1) as string) && each.includes("USDC")
+      );
+      if (target.length == 1) {
+        bestPools.push(target.at(0));
+        bestPools.push(value.pairName);
+        break;
+      }
+    } else if (pairNames.at(1) == "SOL") {
+      const target = Object.keys(OrcaPoolConfig).filter(
+        (each) =>
+          each.includes(pairNames.at(0) as string) && each.includes("USDC")
+      );
+      if (target.length == 1) {
+        bestPools.push(target.at(0));
+        bestPools.push(value.pairName);
+        break;
+      }
+    }
+  }
+  return bestPools;
 };
 
 const performSwap = async (
   orcaPool: OrcaPool,
   inputAmount: any,
+  inputToken: OrcaToken,
   slippageTolerance: any,
   fee: any
 ) => {
@@ -65,16 +184,14 @@ const performSwap = async (
   );
   const TransactionPayload = await orcaPool.swap(
     wallet,
-    orcaPool.getTokenA(),
+    inputToken,
     inputAmount,
     minOutputAmount
   );
   const signature = TransactionPayload.execute();
 
   console.log(
-    `${
-      orcaPool.getTokenA().tag
-    } swap transaction: ${signature} swaped ${outputAmount}`
+    `${inputToken.tag} swap transaction: ${signature} swaped ${outputAmount}`
   );
   return outputAmount;
 };
@@ -128,99 +245,136 @@ const runBot = async () => {
     try {
       const orca = getOrca(connection);
       console.log("Pools initialized.");
-      const solUsdcPool = orca.getPool(OrcaPoolConfig.SOL_USDC);
-      const ethUsdcPool = orca.getPool(OrcaPoolConfig.ETH_USDC);
-      const ethSolPool = orca.getPool(OrcaPoolConfig.ETH_SOL);
+      const SwapPools = await getBestPoolForPair(orca);
+      if (SwapPools.length != 3) break;
+      const firstPool = orca.getPool(
+        OrcaPoolConfig[SwapPools.at(0)! as keyof typeof OrcaPoolConfig]
+      );
+      const secondPool = orca.getPool(
+        OrcaPoolConfig[SwapPools.at(1)! as keyof typeof OrcaPoolConfig]
+      );
+      const thirdPool = orca.getPool(
+        OrcaPoolConfig[SwapPools.at(2)! as keyof typeof OrcaPoolConfig]
+      );
 
       /************************** Get Exchange Rate **********************/
 
-      const solUsdcTokenABalance = await connection.getTokenAccountBalance(
-        solUsdcPool.getTokenA().addr
+      const firstPairNames = SwapPools.at(0)?.split("_");
+      const secondPairNames = SwapPools.at(1)?.split("_");
+      const thirdPairNames = SwapPools.at(2)?.split("_");
+
+      const firstTokenABalance = await connection.getTokenAccountBalance(
+        firstPool.getTokenA().addr
       );
-      const solUsdcTokenBBalance = await connection.getTokenAccountBalance(
-        solUsdcPool.getTokenB().addr
+      const firstTokenBBalance = await connection.getTokenAccountBalance(
+        firstPool.getTokenB().addr
       );
-      const ethUsdcTokenABalance = await connection.getTokenAccountBalance(
-        ethUsdcPool.getTokenA().addr
+      const secondTokenABalance = await connection.getTokenAccountBalance(
+        secondPool.getTokenA().addr
       );
-      const ethUsdcTokenBBalance = await connection.getTokenAccountBalance(
-        ethUsdcPool.getTokenB().addr
+      const secondTokenBBalance = await connection.getTokenAccountBalance(
+        secondPool.getTokenB().addr
       );
-      const ethSolTokenABalance = await connection.getTokenAccountBalance(
-        ethSolPool.getTokenA().addr
+      const thirdTokenABalance = await connection.getTokenAccountBalance(
+        thirdPool.getTokenA().addr
       );
-      const ethSolTokenBBalance = await connection.getTokenAccountBalance(
-        ethSolPool.getTokenB().addr
+      const thirdTokenBBalance = await connection.getTokenAccountBalance(
+        thirdPool.getTokenB().addr
       );
-      const solUsdcTokenAAmount =
-        parseFloat(solUsdcTokenABalance.value.amount) /
-        Math.pow(10, solUsdcPool.getTokenA().scale);
-      const solUsdcTokenBAmount =
-        parseFloat(solUsdcTokenBBalance.value.amount) /
-        Math.pow(10, solUsdcPool.getTokenB().scale);
-      const ethUsdcTokenAAmount =
-        parseFloat(ethUsdcTokenABalance.value.amount) /
-        Math.pow(10, ethUsdcPool.getTokenA().scale);
-      const ethUsdcTokenBAmount =
-        parseFloat(ethUsdcTokenBBalance.value.amount) /
-        Math.pow(10, ethUsdcPool.getTokenB().scale);
-      const ethSolTokenAAmount =
-        parseFloat(ethSolTokenABalance.value.amount) /
-        Math.pow(10, ethSolPool.getTokenA().scale);
-      const ethSolTokenBAmount =
-        parseFloat(ethSolTokenBBalance.value.amount) /
-        Math.pow(10, ethSolPool.getTokenB().scale);
+      const firstTokenAAmount =
+        parseFloat(firstTokenABalance.value.amount) /
+        Math.pow(10, firstPool.getTokenA().scale);
+      const firstTokenBAmount =
+        parseFloat(firstTokenBBalance.value.amount) /
+        Math.pow(10, firstPool.getTokenB().scale);
+      const secondTokenAAmount =
+        parseFloat(secondTokenABalance.value.amount) /
+        Math.pow(10, secondPool.getTokenA().scale);
+      const secondTokenBAmount =
+        parseFloat(secondTokenBBalance.value.amount) /
+        Math.pow(10, secondPool.getTokenB().scale);
+      const thirdTokenAAmount =
+        parseFloat(thirdTokenABalance.value.amount) /
+        Math.pow(10, thirdPool.getTokenA().scale);
+      const thirdTokenBAmount =
+        parseFloat(thirdTokenBBalance.value.amount) /
+        Math.pow(10, thirdPool.getTokenB().scale);
+
+      const firstRate = Decimal(firstTokenBAmount / firstTokenAAmount);
+      const secondRate =
+        firstPairNames?.at(1) == secondPairNames?.at(0)
+          ? Decimal(secondTokenBAmount / secondTokenAAmount)
+          : Decimal(secondTokenAAmount / secondTokenBAmount);
+      const thirdRate = Decimal(thirdTokenBAmount / thirdTokenAAmount);
       console.log(
-        `Exchange Rate (SOL → USDC): ${
-          solUsdcTokenBAmount / solUsdcTokenAAmount
-        }`
+        `Exchange Rate (${firstPairNames?.at(0)} → ${firstPairNames?.at(
+          1
+        )}): ${firstRate}`
       );
       console.log(
-        `Exchange Rate (USDC → ETH): ${
-          ethUsdcTokenAAmount / ethUsdcTokenBAmount
-        }`
+        `Exchange Rate (${secondPairNames?.at(1)} → ${secondPairNames?.at(
+          0
+        )}): ${secondRate}`
       );
       console.log(
-        `Exchange Rate (ETH → SOL): ${ethSolTokenBAmount / ethSolTokenAAmount}`
+        `Exchange Rate (${thirdPairNames?.at(0)} → ${thirdPairNames?.at(
+          1
+        )}): ${thirdRate}`
       );
-      const solToUsdcRate = Decimal(solUsdcTokenBAmount / solUsdcTokenAAmount);
-      const usdcToEthRate = Decimal(ethUsdcTokenAAmount / ethUsdcTokenBAmount);
-      const ethToSolRate = Decimal(ethSolTokenBAmount / ethSolTokenAAmount);
 
       /********************* Get Transaction Fee **************************/
 
       const amountToSwap = new Decimal(0.1); // Swap 0.1 SOL
       const slippage = new Decimal(0.01); // 1% slippage tolerance
 
-      const solUsdcSwapTranPayload = await solUsdcPool.swap(
-        wallet, // Wallet used to sign the transaction
-        solUsdcPool.getTokenA(), // Token A (SOL) being swapped
+      const SwapTranPayload = await secondPool.swap(
+        secondPool.getTokenA().addr, // Wallet used to sign the transaction
+        secondPool.getTokenA(), // Token A (SOL) being swapped
         amountToSwap, // Amount of SOL to swap
         slippage // Slippage tolerance
       );
       const latestBlockhash = await connection.getLatestBlockhash();
-      const solUsdcSwapTransaction = solUsdcSwapTranPayload.transaction;
-      solUsdcSwapTransaction.recentBlockhash = latestBlockhash.blockhash;
-      const solUsdcMessage = solUsdcSwapTransaction.compileMessage();
+      const SwapTransaction = SwapTranPayload.transaction;
+      SwapTransaction.recentBlockhash = latestBlockhash.blockhash;
+      const SwapMessage = SwapTransaction.compileMessage();
 
       // Calculate the fee for the transaction
-      const solUsdcFee = await connection.getFeeForMessage(solUsdcMessage);
-      let swapFee = 0;
-      if (solUsdcFee.value !== null) {
-        console.log(`Transaction Fee: ${solUsdcFee.value / 1_000_000_000} SOL`);
-        swapFee = solUsdcFee.value / 1_000_000_000;
+      const lamportsFee = await connection.getFeeForMessage(SwapMessage);
+      let transFee = 0;
+      if (lamportsFee.value !== null) {
+        console.log(`Transaction Fee: ${lamportsFee.value / 1e9} SOL`);
+        transFee = lamportsFee.value / 1e9;
       } else {
         console.log("Unable to calculate the fee. Blockhash might be invalid.");
       }
 
+      /********************* Customize Priority Fee ***********************/
+
+      const priorityFee: any = await calculatePriorityFee(
+        SwapTranPayload.transaction
+      );
+
+      console.log(
+        `Transaction sent with Priority Fee: ${priorityFee / 1e9} SOL`
+      );
+      console.log(`Transaction ID: ${SwapTranPayload.transaction.signature}`);
+
       /*********************** Calculate profit ****************************/
       const startAmount = new Decimal(1);
+      const [firstSwapFee, secondSwapFee, thirdSwapFee] = await Promise.all([
+        calculateSwapFee(firstPool),
+        calculateSwapFee(secondPool),
+        calculateSwapFee(thirdPool),
+      ]);
       const profit = calculateProfit(
         startAmount,
-        solToUsdcRate,
-        usdcToEthRate,
-        ethToSolRate,
-        Decimal(swapFee)
+        firstRate,
+        secondRate,
+        thirdRate,
+        firstSwapFee.fee,
+        secondSwapFee.fee,
+        thirdSwapFee.fee,
+        Decimal(transFee)
       );
       const profitPercentage = profit.div(startAmount).mul(100);
       console.log(
@@ -240,25 +394,32 @@ const runBot = async () => {
       if (balance >= MIN_SWAP_AMOUNT)
         if (profitPercentage.gt(MIN_PROFIT_THRESHOLD)) {
           //MIN_SWAP_AMOUNT
-          let outputAmount = performSwap(
-            solUsdcPool,
+          let outputAmount = await performSwap(
+            firstPool,
             inputSOLInLamports,
+            firstPool.getTokenA(),
             slippage,
-            swapFee
+            firstSwapFee
           );
-          outputAmount = performSwap(
-            ethUsdcPool,
+          outputAmount = await performSwap(
+            secondPool,
             outputAmount,
+            firstPairNames?.at(1) == secondPairNames?.at(0)
+              ? secondPool.getTokenA()
+              : secondPool.getTokenB(),
             slippage,
-            swapFee
+            secondSwapFee
           );
-          outputAmount = performSwap(
-            ethSolPool,
+          outputAmount = await performSwap(
+            thirdPool,
             outputAmount,
+            thirdPool.getTokenA(),
             slippage,
-            swapFee
+            thirdSwapFee
           );
         }
+
+      await new Promise((resolve) => setTimeout(resolve, 1000));
     } catch (err) {
       console.log("ERROR: ", err);
     }
